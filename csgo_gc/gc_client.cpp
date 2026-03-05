@@ -2,45 +2,24 @@
 #include "gc_client.h"
 #include "graffiti.h"
 #include "keyvalue.h"
+#include "steam/isteamuser.h" // MicroTxnAuthorizationResponse_t
 
-ClientGC::ClientGC(uint64_t steamId)
+const char *MessageName(uint32_t type);
+
+ClientGC::ClientGC(uint64_t steamId, ISteamNetworkingMessages *networkingMessages)
     : m_steamId{ steamId }
+    , m_networking{ this, networkingMessages }
     , m_inventory{ steamId, m_config }
 {
+    Platform::Print("ClientGC spawned for user %llu\n", steamId);
+
     // also called from ServerGC's constructor
     Graffiti::Initialize();
-
-    StartThread();
-
-    Platform::Print("ClientGC spawned for user %llu\n", steamId);
 }
 
 ClientGC::~ClientGC()
 {
-    StopThread();
     Platform::Print("ClientGC destroyed\n");
-}
-
-void ClientGC::HandleEvent(GCEvent type, uint64_t id, const std::vector<uint8_t> &buffer)
-{
-    switch (type)
-    {
-    case GCEvent::Message:
-        HandleMessage(static_cast<uint32_t>(id), buffer.data(), static_cast<uint32_t>(buffer.size()));
-        break;
-
-    case GCEvent::NetMessage:
-        HandleNetMessage(buffer.data(), static_cast<uint32_t>(buffer.size()));
-        break;
-
-    case GCEvent::SOCacheRequest:
-        HandleSOCacheRequest();
-        break;
-
-    default:
-        assert(false);
-        break;
-    }
 }
 
 void ClientGC::HandleMessage(uint32_t type, const void *data, uint32_t size)
@@ -134,15 +113,35 @@ void ClientGC::HandleMessage(uint32_t type, const void *data, uint32_t size)
     }
 }
 
-void ClientGC::HandleNetMessage(const void *data, uint32_t size)
+void ClientGC::Update()
 {
-    // pass 0 as type so it gets parsed from the message
-    GCMessageRead messageRead{ 0, data, size };
-    if (!messageRead.IsValid())
+    m_networking.Update();
+}
+
+bool ClientGC::GetMicroTransactionResponse(MicroTxnAuthorizationResponse_t &response)
+{
+    if (m_transaction.id)
     {
-        assert(false);
-        return;
+        // only m_bAuthorized gets read
+        response.m_bAuthorized = 1;
+        return true;
     }
+
+    return false;
+}
+
+void ClientGC::SendSOCacheToGameSever()
+{
+    CMsgSOCacheSubscribed message;
+    m_inventory.BuildCacheSubscription(message, m_config.Level(), true);
+
+    GCMessageWrite messageWrite{ k_ESOMsg_CacheSubscribed, message };
+    m_networking.SendMessage(messageWrite);
+}
+
+void ClientGC::HandleNetMessage(GCMessageRead &messageRead)
+{
+    assert(messageRead.IsValid());
 
     if (messageRead.IsProtobuf())
     {
@@ -158,26 +157,25 @@ void ClientGC::HandleNetMessage(const void *data, uint32_t size)
         MessageName(messageRead.TypeUnmasked()));
 }
 
-void ClientGC::HandleSOCacheRequest()
+void ClientGC::SetAuthTicket(uint32_t handle, const void *data, uint32_t size)
 {
-    CMsgSOCacheSubscribed message;
-    m_inventory.BuildCacheSubscription(message, m_config.Level(), true);
+    m_networking.SetAuthTicket(handle, data, size);
+}
 
-    GCMessageWrite messageWrite{ k_ESOMsg_CacheSubscribed, message };
-    PostToHost(HostEvent::NetMessage, 0, messageWrite.Data(), messageWrite.Size());
+void ClientGC::ClearAuthTicket(uint32_t handle)
+{
+    m_networking.ClearAuthTicket(handle);
 }
 
 void ClientGC::SendMessageToGame(bool sendToGameServer, uint32_t type,
     const google::protobuf::MessageLite &message, uint64_t jobId)
 {
-    GCMessageWrite messageWrite{ type, message, jobId };
+    const GCMessageWrite &messageWrite = m_outgoingMessages.emplace(type, message, jobId);
 
     if (sendToGameServer)
     {
-        PostToHost(HostEvent::NetMessage, 0, messageWrite.Data(), messageWrite.Size());
+        m_networking.SendMessage(messageWrite);
     }
-
-    PostToHost(HostEvent::Message, messageWrite.TypeMasked(), messageWrite.Data(), messageWrite.Size());
 }
 
 constexpr uint32_t MakeAddress(uint32_t v1, uint32_t v2, uint32_t v3, uint32_t v4)
@@ -200,12 +198,12 @@ void ClientGC::BuildMatchmakingHello(CMsgGCCStrike15_v2_MatchmakingGC2ClientHell
     message.set_account_id(AccountId());
 
     // this is the state of csgo matchmaking in 2024
-    message.mutable_global_stats()->set_players_online(0);
-    message.mutable_global_stats()->set_servers_online(0);
-    message.mutable_global_stats()->set_players_searching(0);
-    message.mutable_global_stats()->set_servers_available(0);
-    message.mutable_global_stats()->set_ongoing_matches(0);
-    message.mutable_global_stats()->set_search_time_avg(0);
+    message.mutable_global_stats()->set_players_online(1);
+    message.mutable_global_stats()->set_servers_online(1);
+    message.mutable_global_stats()->set_players_searching(1);
+    message.mutable_global_stats()->set_servers_available(1);
+    message.mutable_global_stats()->set_ongoing_matches(1);
+    message.mutable_global_stats()->set_search_time_avg(1);
 
     // don't write search_statistics
 
@@ -236,11 +234,11 @@ void ClientGC::BuildClientWelcome(CMsgClientWelcome &message, const CMsgCStrike1
     m_inventory.BuildCacheSubscription(*message.add_outofdate_subscribed_caches(), m_config.Level(), false);
     message.mutable_location()->set_latitude(65.0133006f);
     message.mutable_location()->set_longitude(25.4646212f);
-    message.mutable_location()->set_country("FI"); // finland
+    message.mutable_location()->set_country("CA"); // Canada
     message.set_game_data2(matchmakingHello.SerializeAsString());
     message.set_rtime32_gc_welcome_timestamp(static_cast<uint32_t>(time(nullptr)));
-    message.set_currency(2); // euros
-    message.set_txn_country_code("FI"); // finland
+    message.set_currency(1); // euros
+    message.set_txn_country_code("CA"); // Canada
 }
 
 void ClientGC::SendRankUpdate()
@@ -411,7 +409,7 @@ void ClientGC::SetItemPositions(GCMessageRead &messageRead)
         {
             // send these to the server only
             GCMessageWrite messageWrite{ k_EMsgGCItemAcknowledged, acknowledgement };
-            PostToHost(HostEvent::NetMessage, 0, messageWrite.Data(), messageWrite.Size());
+            m_networking.SendMessage(messageWrite);
         }
 
         SendMessageToGame(true, k_ESOMsg_UpdateMultiple, update);
@@ -518,7 +516,6 @@ void ClientGC::StoreGetUserData(GCMessageRead &messageRead)
     binaryString.reserve(1 << 17);
     priceSheet.BinaryWriteToString(binaryString);
 
-    // fuck you idiot
     CMsgStoreGetUserDataResponse response;
     response.set_result(1);
     response.set_price_sheet_version(1729); // what
@@ -536,12 +533,9 @@ void ClientGC::StorePurchaseInit(GCMessageRead &messageRead)
         return;
     }
 
-    // value doesn't matter
-    uint64_t transactionId = Random{}.Integer<uint64_t>();
-
-    assert(!m_transactionId);
-    m_transactionId = transactionId;
-    m_transactionItemIds.reserve(message.line_items_size()); // rough approx
+    assert(!m_transaction.id);
+    m_transaction.id = Random{}.Integer<uint64_t>(); // doesn't matter
+    m_transaction.itemIds.reserve(message.line_items_size()); // rough approx
 
     // inventory update response
     std::vector<CMsgSOSingleObject> inventoryUpdate;
@@ -557,19 +551,19 @@ void ClientGC::StorePurchaseInit(GCMessageRead &messageRead)
             }
             else
             {
-                m_transactionItemIds.push_back(itemId);
+                m_transaction.itemIds.push_back(itemId);
             }
         }
     }
 
     char url[128]; // url doesn't matter, but it needs to be set
-    snprintf(url, sizeof(url), "https://checkout.steampowered.com/checkout/approvetxn/%llu/?returnurl=steam", transactionId);
+    snprintf(url, sizeof(url), "https://checkout.steampowered.com/checkout/approvetxn/%llu/?returnurl=steam", m_transaction.id);
 
     CMsgGCStorePurchaseInitResponse response;
-    response.set_result(1); // success
-    response.set_txn_id(transactionId);
+    response.set_result(1);  // success
+    response.set_txn_id(m_transaction.id);
     response.set_url(url);
-    response.mutable_item_ids()->Assign(m_transactionItemIds.begin(), m_transactionItemIds.end());
+    *response.mutable_item_ids() = { m_transaction.itemIds.begin(), m_transaction.itemIds.end() };
 
     SendMessageToGame(false, k_EMsgGCStorePurchaseInitResponse, response, messageRead.JobId());
 
@@ -578,9 +572,6 @@ void ClientGC::StorePurchaseInit(GCMessageRead &messageRead)
     {
         SendMessageToGame(true, k_ESOMsg_Create, newItem);
     }
-
-    // this will run the steam callback
-    PostToHost(HostEvent::MicroTransactionResponse, 0, nullptr, 0);
 }
 
 void ClientGC::StorePurchaseFinalize(GCMessageRead &messageRead)
@@ -592,16 +583,17 @@ void ClientGC::StorePurchaseFinalize(GCMessageRead &messageRead)
         return;
     }
 
-    assert(m_transactionId);
+    assert(m_transaction.id);
 
     CMsgGCStorePurchaseFinalizeResponse response;
     response.set_result(1); // success
-    response.mutable_item_ids()->Assign(m_transactionItemIds.begin(), m_transactionItemIds.end());
+    *response.mutable_item_ids() = { m_transaction.itemIds.begin(), m_transaction.itemIds.end() };
     SendMessageToGame(false, k_EMsgGCStorePurchaseFinalizeResponse, response, messageRead.JobId());
 
     // done with this one
-    m_transactionId = 0;
+    m_transaction.id = 0;
 }
+
 
 void ClientGC::DeleteItem(GCMessageRead &messageRead)
 {
