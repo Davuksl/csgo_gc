@@ -1,0 +1,4 @@
+C:/Users/javae/OneDrive/Документы/github/repos/csgo_gc/launcher/build/CMakeFiles/csgo.dir
+C:/Users/javae/OneDrive/Документы/github/repos/csgo_gc/launcher/build/CMakeFiles/srcds.dir
+C:/Users/javae/OneDrive/Документы/github/repos/csgo_gc/launcher/build/CMakeFiles/ALL_BUILD.dir
+C:/Users/javae/OneDrive/Документы/github/repos/csgo_gc/launcher/build/CMakeFiles/ZERO_CHECK.dir
