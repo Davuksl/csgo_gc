@@ -32,7 +32,7 @@ While it's still possible to connect CS:GO to CS2's GC by spoofing the version n
 
 I'm still looking for the **full** CS:GO Item Schema. If you have a relatively recent copy of it and are willing to share it, let me know!
 
-## Not planned
+## Will be added soon
 - Matchmaking (can't be implemented without a centralized server)
 
 ## Installation
