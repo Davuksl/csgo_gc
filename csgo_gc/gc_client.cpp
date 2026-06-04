@@ -96,6 +96,14 @@ void ClientGC::HandleMessage(uint32_t type, const void *data, uint32_t size)
             StorePurchaseFinalize(messageRead);
             break;
 
+        case k_EMsgGCCStrike15_v2_MatchmakingStart:
+            MatchmakingStart(messageRead);
+            break;
+
+        case k_EMsgGCCStrike15_v2_MatchmakingStop:
+            MatchmakingStop(messageRead);
+            break;
+
         default:
             Platform::Print("ClientGC::HandleMessage: unhandled protobuf message %s\n",
                 MessageName(messageRead.TypeUnmasked()));
@@ -200,24 +208,33 @@ void ClientGC::BuildMatchmakingHello(CMsgGCCStrike15_v2_MatchmakingGC2ClientHell
     message.set_account_id(AccountId());
 
     // this is the state of csgo matchmaking in 2024
-    message.mutable_global_stats()->set_players_online(1);
-    message.mutable_global_stats()->set_servers_online(1);
-    message.mutable_global_stats()->set_players_searching(1);
-    message.mutable_global_stats()->set_servers_available(1);
-    message.mutable_global_stats()->set_ongoing_matches(1);
-    message.mutable_global_stats()->set_search_time_avg(1);
+    message.mutable_global_stats()->set_players_online(1337);
+    message.mutable_global_stats()->set_servers_online(420);
+    message.mutable_global_stats()->set_players_searching(69);
+    message.mutable_global_stats()->set_servers_available(100);
+    message.mutable_global_stats()->set_ongoing_matches(50);
+    message.mutable_global_stats()->set_search_time_avg(30);
 
-    // don't write search_statistics
+    // add some search stats for different modes to make the UI happy
+    for (uint32_t i = 0; i < 16; i++)
+    {
+        auto *stat = message.mutable_global_stats()->add_search_statistics();
+        stat->set_game_type(i);
+        stat->set_search_time_avg(10 + i);
+        stat->set_players_searching(100 + i * 10);
+    }
 
     message.mutable_global_stats()->set_main_post_url("http://127.0.0.1:8080");
 
     // bullshit
-    message.mutable_global_stats()->set_required_appid_version(13857);
+    message.mutable_global_stats()->set_required_appid_version(13987); // last legacy version
     message.mutable_global_stats()->set_pricesheet_version(1680057676); // mikkotodo revisit
     message.mutable_global_stats()->set_twitch_streams_version(2);
     message.mutable_global_stats()->set_active_tournament_eventid(20);
     message.mutable_global_stats()->set_active_survey_id(0);
-    message.mutable_global_stats()->set_required_appid_version2(13862); // csgo s2
+    message.mutable_global_stats()->set_required_appid_version2(13987);
+    message.mutable_global_stats()->set_rtime32_cur(static_cast<uint32_t>(time(nullptr)));
+    message.mutable_global_stats()->set_rtime32_event_start(static_cast<uint32_t>(time(nullptr)) - 3600);
 
     message.set_vac_banned(GetConfig().VacBanned());
     message.mutable_commendation()->set_cmd_friendly(GetConfig().CommendedFriendly());
@@ -296,6 +313,17 @@ void ClientGC::OnClientHello(GCMessageRead &messageRead)
 
     // send all ranks here as well, it's a bit back and forth with real gc
     SendRankUpdate();
+
+    // tell the client matchmaking is available
+    CMsgGCCStrike15_v2_MatchmakingGC2ClientUpdate mmUpdate;
+    mmUpdate.set_matchmaking(0); // None, but it updates the state
+    *mmUpdate.mutable_global_stats() = mmHello.global_stats();
+    SendMessageToGame(false, k_EMsgGCCStrike15_v2_MatchmakingGC2ClientUpdate, mmUpdate);
+
+    // tell the client we have a session
+    CMsgConnectionStatus connectionStatus;
+    connectionStatus.set_status(GCConnectionStatus_HAVE_SESSION);
+    SendMessageToGame(false, k_EMsgGCClientConnectionStatus, connectionStatus);
 }
 
 void ClientGC::AdjustItemEquippedState(GCMessageRead &messageRead)
@@ -601,6 +629,67 @@ void ClientGC::StorePurchaseFinalize(GCMessageRead &messageRead)
 
     // done with this one
     m_transactionId = 0;
+}
+
+void ClientGC::MatchmakingStart(GCMessageRead &messageRead)
+{
+    CMsgGCCStrike15_v2_MatchmakingStart message;
+    if (!messageRead.ReadProtobuf(message))
+    {
+        Platform::Print("Parsing CMsgGCCStrike15_v2_MatchmakingStart failed, ignoring\n");
+        return;
+    }
+
+    Platform::Print("Matchmaking search started for game type %u\n", message.game_type());
+
+    // tell the client we are searching
+    CMsgGCCStrike15_v2_MatchmakingGC2ClientUpdate update;
+    update.set_matchmaking(1); // searching
+    SendMessageToGame(false, k_EMsgGCCStrike15_v2_MatchmakingGC2ClientUpdate, update);
+
+    // TODO: implement actual matchmaking logic here
+    // for now, just find a "match" after 5 seconds
+    // but since we are in a single-threaded-ish environment for this logic, 
+    // maybe just send the reservation immediately for testing?
+    
+    // the user asked to "throw to a random server"
+    // I will simulate finding a match and sending a reservation
+    
+    CMsgGCCStrike15_v2_MatchmakingGC2ClientReserve reserve;
+    reserve.set_serverid(12345);
+    reserve.set_direct_udp_ip(MakeAddress(127, 0, 0, 1)); // placeholder
+    reserve.set_direct_udp_port(27015);
+    reserve.set_reservationid(GameServerCookieId);
+    reserve.set_map("de_dust2");
+    reserve.set_server_address("127.0.0.1:27015");
+
+    // populate reservation details
+    auto *details = reserve.mutable_reservation();
+    details->add_account_ids(AccountId());
+    details->set_game_type(message.game_type());
+    details->set_match_id(Random{}.Integer<uint64_t>());
+    details->set_server_version(13987);
+    details->set_encryption_key(Random{}.Integer<uint64_t>());
+    details->set_encryption_key_pub(Random{}.Integer<uint64_t>());
+
+    // we should probably wait a bit before sending this, but for now let's see if it works
+    SendMessageToGame(false, k_EMsgGCCStrike15_v2_MatchmakingGC2ClientReserve, reserve);
+}
+
+void ClientGC::MatchmakingStop(GCMessageRead &messageRead)
+{
+    CMsgGCCStrike15_v2_MatchmakingStop message;
+    if (!messageRead.ReadProtobuf(message))
+    {
+        Platform::Print("Parsing CMsgGCCStrike15_v2_MatchmakingStop failed, ignoring\n");
+        return;
+    }
+
+    Platform::Print("Matchmaking search stopped\n");
+
+    CMsgGCCStrike15_v2_MatchmakingGC2ClientUpdate update;
+    update.set_matchmaking(0); // none
+    SendMessageToGame(false, k_EMsgGCCStrike15_v2_MatchmakingGC2ClientUpdate, update);
 }
 
 void ClientGC::DeleteItem(GCMessageRead &messageRead)
